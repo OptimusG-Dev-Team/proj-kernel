@@ -1601,6 +1601,9 @@ int q6asm_open_write(struct audio_client *ac, uint32_t format)
 	if (!rc) {
 		pr_err("%s: timeout. waited for OPEN_WRITE rc[%d]\n", __func__,
 			rc);
+#ifdef CONFIG_LGE_AUDIO
+		panic("Q6asm pcm open timeout : please contact kkfusion3-bsp-audio@lge.com");
+#endif
 		goto fail_cmd;
 	}
 	if (atomic_read(&ac->cmd_response)) {
