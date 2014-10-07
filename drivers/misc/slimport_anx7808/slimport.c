@@ -25,6 +25,7 @@
 #include <linux/workqueue.h>
 #include <linux/wakelock.h>
 #include <linux/slimport.h>
+#include <linux/async.h>
 
 #include "slimport_tx_drv.h"
 
@@ -346,11 +347,13 @@ static irqreturn_t anx7808_cbl_det_isr(int irq, void *data)
 
 	if (gpio_get_value(anx7808->pdata->gpio_cbl_det)) {
 		wake_lock(&anx7808->slimport_lock);
+		hdmi_common_set_hpd_on(1);
 		pr_info("%s : detect cable insertion\n", __func__);
 		queue_delayed_work(anx7808->workqueue, &anx7808->work, 0);
 	} else {
 		pr_info("%s : detect cable removal\n", __func__);
 		cancel_delayed_work_sync(&anx7808->work);
+		hdmi_common_set_hpd_on(0);
 		wake_unlock(&anx7808->slimport_lock);
 		wake_lock_timeout(&anx7808->slimport_lock, 2*HZ);
 	}
@@ -413,7 +416,7 @@ static int anx7808_i2c_probe(struct i2c_client *client,
 	if (anx7808->workqueue == NULL) {
 		pr_err("%s: failed to create work queue\n", __func__);
 		ret = -ENOMEM;
-		goto err2;
+		goto err1;
 	}
 
 	anx7808->pdata->avdd_power(1);
@@ -537,14 +540,19 @@ static struct i2c_driver anx7808_driver = {
 	.id_table  = anx7808_id,
 };
 
-static int __init anx7808_init(void)
+static void __init anx7808_init_async(void *data, async_cookie_t cookie)
 {
 	int ret = 0;
 
 	ret = i2c_add_driver(&anx7808_driver);
 	if (ret < 0)
 		pr_err("%s: failed to register anx7808 i2c drivern", __func__);
-	return ret;
+}
+
+static int __init anx7808_init(void)
+{
+	async_schedule(anx7808_init_async, NULL);
+	return 0;
 }
 
 static void __exit anx7808_exit(void)

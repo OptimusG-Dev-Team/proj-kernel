@@ -50,7 +50,7 @@ static unchar sp_tx_hw_hdcp_en;
 static unchar sp_tx_hdcp_auth_done;
 
 bool anx7808_ver_ba;
-
+bool sp_tx_rx_vga;
 unchar sp_tx_pd_mode;
 unchar sp_tx_rx_anx7730;
 unchar sp_tx_rx_mydp;
@@ -131,7 +131,7 @@ static void sp_tx_api_m_gen_clk_select(unchar bspreading)
 static void sp_tx_link_phy_initialization(void)
 {
 	/* PHY parameter for cts */
-
+#ifndef CONFIG_MACH_APQ8064_AWIFI
 	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG4, 0x1b);
 	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG7, 0x22);
 	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG9, 0x23);
@@ -153,6 +153,27 @@ static void sp_tx_link_phy_initialization(void)
 		sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG16, 0x10);
 	}
 	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG3, 0x3F);
+#else
+	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG0, 0x19);
+	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG1, 0x26);
+	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG2, 0x3F);
+	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG3, 0x3F);
+	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG4, 0x1b);
+	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG5, 0x28);
+	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG6, 0x3c);
+	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG7, 0x22);
+	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG8, 0x2F);
+	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG9, 0x23);
+	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG12, 0x0E);
+	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG14, 0x09);
+	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG15, 0x10);
+	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG16, 0x1F);
+	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG17, 0x16);
+	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG18, 0x1F);
+	sp_write_reg(TX_P1, SP_TX_LT_CTRL_REG19, 0x1F);
+	
+	sp_write_reg(TX_P2, 0xDC, 0x68);
+#endif
 }
 
 void sp_tx_initialization(void)
@@ -1950,22 +1971,28 @@ unchar sp_tx_get_cable_type(void)
 			sp_tx_rx_mydp = 1;
 			sp_tx_rx_anx7730 = 0;
 			ds_port_recoginze = 1;
+			sp_tx_rx_vga=0;
 			pr_notice("Downstream is DP dongle.");
 			break;
 		case 0x03:
 			sp_tx_aux_dpcdread_bytes(0x00, 0x04, 0x00, 8, SINK_OUI);
 
-			if ((SINK_OUI[0] == 0x00) && (SINK_OUI[1] == 0x22)
-			    && (SINK_OUI[2] == 0xb9)
-			    && (SINK_OUI[3] == 0x61) && (SINK_OUI[4] == 0x39)
-			    && (SINK_OUI[5] == 0x38)
-			    && (SINK_OUI[6] == 0x33)) {
+			if (((SINK_OUI[0] == 0x00) && (SINK_OUI[1] == 0x22)
+			    && (SINK_OUI[2] == 0xb9) && (SINK_OUI[3] == 0x61)
+			    && (SINK_OUI[4] == 0x39) && (SINK_OUI[5] == 0x38)
+			    && (SINK_OUI[6] == 0x33))||
+			    ((SINK_OUI[0] == 0x00) && (SINK_OUI[1] == 0x22)
+			    && (SINK_OUI[2] == 0xb9) && (SINK_OUI[3] == 0x73)
+			    && (SINK_OUI[4] == 0x69) && (SINK_OUI[5] == 0x76)
+			    && (SINK_OUI[6] == 0x61))) {
 				pr_notice("Downstream is VGA dongle.");
+				sp_tx_rx_vga=1;
 				sp_tx_rx_anx7730 = 0;
 				sp_tx_rx_mydp = 0;
 			} else {
 				sp_tx_rx_mydp = 1;
 				sp_tx_rx_anx7730 = 0;
+				sp_tx_rx_vga=0;
 				pr_notice("Downstream is general DP2VGA converter.");
 			}
 			ds_port_recoginze = 1;
@@ -1987,6 +2014,7 @@ unchar sp_tx_get_cable_type(void)
 				sp_tx_rx_anx7730 = 0;
 				pr_notice("Downstream is general DP2HDMI converter.");
 			}
+			sp_tx_rx_vga=0;
 			ds_port_recoginze = 1;
 			break;
 		default:
@@ -1994,6 +2022,7 @@ unchar sp_tx_get_cable_type(void)
 			sp_tx_rx_anx7730 = 0;
 			sp_tx_rx_mydp = 0;
 			ds_port_recoginze = 0;
+			sp_tx_rx_vga=0;
 			break;
 		}
 		if (ds_port_recoginze)
@@ -2022,6 +2051,10 @@ bool sp_tx_get_vga_connection(void)
 		return TRUE;
 	else
 		return FALSE;
+}
+bool is_slimport_vga(void)
+{
+	return sp_tx_rx_vga;
 }
 
 static bool sp_tx_get_ds_video_status(void)
