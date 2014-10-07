@@ -553,9 +553,6 @@ struct venc_buffer{
  long long	timestamp;
  unsigned long	flags;
  void	*clientdata;
-	unsigned long	metadata_len;
-	unsigned long	metadata_offset;
-	unsigned long	metadata_ltrid;
 };
 
 struct venc_basecfg{
