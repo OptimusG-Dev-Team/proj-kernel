@@ -1686,6 +1686,9 @@ static void hub_free_dev(struct usb_device *udev)
 		hcd->driver->free_dev(hcd, udev);
 }
 
+static int modem_enumeration_check = 0;
+module_param(modem_enumeration_check, int, S_IRUGO | S_IWUSR);
+
 /**
  * usb_disconnect - disconnect a device (usbcore-internal)
  * @pdev: pointer to device being disconnected
@@ -1714,6 +1717,9 @@ void usb_disconnect(struct usb_device **pdev)
 	usb_set_device_state(udev, USB_STATE_NOTATTACHED);
 	dev_info(&udev->dev, "USB disconnect, device number %d\n",
 			udev->devnum);
+
+	modem_enumeration_check = 0;
+	printk("%s : set modem_enumeration_check to 0!\n", __func__);
 
 #ifdef CONFIG_USB_OTG
 	if (udev->bus->hnp_support && udev->portnum == udev->bus->otg_port) {
@@ -2037,6 +2043,11 @@ int usb_new_device(struct usb_device *udev)
 
 	/* Tell the world! */
 	announce_device(udev);
+
+	if(udev->descriptor.idProduct == 0x9008)
+		modem_enumeration_check = 0x1;
+	else if(udev->descriptor.idProduct == 0x9048)
+		modem_enumeration_check = 0x3;
 
 	device_enable_async_suspend(&udev->dev);
 
