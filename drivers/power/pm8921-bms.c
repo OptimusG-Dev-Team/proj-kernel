@@ -32,6 +32,30 @@
 #include <linux/mutex.h>
 #include <linux/rtc.h>
 
+/*                                                          */
+#ifdef LGE_BMS_DEBUG
+#define pr_bms_fmt(fmt) "[BMS:%s] " fmt, __func__
+#define dbg(fmt, ...) \
+	printk(pr_bms_fmt(fmt), ##__VA_ARGS__)
+#else
+#define dbg(fmt, ...) \
+	do {} while (0)
+#endif
+/*                                                          */
+
+#ifdef CONFIG_LGE_PM
+#if !defined (CONFIG_MACH_APQ8064_L05E)
+/* When low(under 3.3V), happend blue screen. Just protect phone. */
+#define LGE_REPORT_SOC_ONE
+#endif
+/* add for thermister test */
+#include <mach/board_lge.h>
+#endif
+
+#ifdef CONFIG_MACH_APQ8064_AWIFI
+#include <mach/msm_smsm.h>
+#endif
+
 #define BMS_CONTROL		0x224
 #define BMS_S1_DELAY		0x225
 #define BMS_OUTPUT0		0x230
@@ -177,6 +201,7 @@ struct pm8921_bms_chip {
 	int			ibat_at_cv_ua;
 	int			soc_at_cv;
 	int			prev_chg_soc;
+	
 	struct power_supply	*batt_psy;
 	struct wake_lock	low_voltage_wake_lock;
 	int			soc_calc_period;
@@ -197,7 +222,28 @@ struct pm8921_bms_chip {
 	bool			first_report_after_suspend;
 	bool			soc_updated_on_resume;
 	int			last_soc_at_suspend;
+#ifdef CONFIG_LGE_PM
+	/* checked chargerlogo mode */
+	int			chg_logo_mode;
+#endif
+#ifdef CONFIG_MACH_APQ8064_AWIFI
+	unsigned int volt_from_sbl3;
+	bool         warm_restart_flag;
+//	int submmit_sbl3_volt;
+#endif
+#ifdef CONFIG_LGE_PM_BATTERY_SOC_RESCALING
+    int             rescale_soc;
+    unsigned long   last_rescale_soc_time;
+#endif
+#ifdef CONFIG_LGE_PM_BMS_MIN_IAVG_CAL_TIME
+    unsigned long           last_iavg_cal_time;
+	int				last_uuc_uah_iavg;
+#endif
+
 };
+
+
+extern int g_vbat_meas_uv;
 
 /*
  * protects against simultaneous adjustment of ocv based on shutdown soc and
@@ -234,12 +280,21 @@ static int last_real_fcc_mah = -EINVAL;
 static int last_real_fcc_batt_temp = -EINVAL;
 static int battery_removed;
 
+#ifdef  CONFIG_LGE_PM_LOW_BATTERY_VOLTAGE_SOC_CAL_TIME
+static int triggered_very_low_voltage = 0;
+#endif
+#ifdef CONFIG_LGE_PM_BMS_MIN_IAVG_CAL_TIME
+static int get_current_time(unsigned long *now_tm_sec);
+#endif
+
+#if !defined(CONFIG_LGE_PM_EXT_GAUGE)
 static int pm8921_battery_gauge_alarm_notify(struct notifier_block *nb,
 				unsigned long status, void *unused);
 
 static struct notifier_block alarm_notifier = {
 	.notifier_call = pm8921_battery_gauge_alarm_notify,
 };
+#endif
 
 static int bms_ro_ops_set(const char *val, const struct kernel_param *kp)
 {
@@ -377,6 +432,7 @@ static int pm_bms_get_rt_status(struct pm8921_bms_chip *chip, int irq_id)
 					chip->pmic_bms_irq[irq_id]);
 }
 
+#if !defined(CONFIG_LGE_PM_EXT_GAUGE)
 static void pm8921_bms_enable_irq(struct pm8921_bms_chip *chip, int interrupt)
 {
 	if (!__test_and_set_bit(interrupt, chip->enabled_irqs)) {
@@ -385,6 +441,7 @@ static void pm8921_bms_enable_irq(struct pm8921_bms_chip *chip, int interrupt)
 		enable_irq(chip->pmic_bms_irq[interrupt]);
 	}
 }
+#endif
 
 static void pm8921_bms_disable_irq(struct pm8921_bms_chip *chip, int interrupt)
 {
@@ -419,6 +476,10 @@ static int usb_chg_plugged_in(struct pm8921_bms_chip *chip)
 {
 	int val = pm8921_is_usb_chg_plugged_in();
 
+#ifdef CONFIG_LGE_WIRELESS_CHARGER
+	if(val == 0)
+		val = pm8921_is_dc_chg_plugged_in();
+#endif
 	/* if the charger driver was not initialized, use the restart reason */
 	if (val == -EINVAL) {
 		if (pm8xxx_restart_reason(chip->dev->parent)
@@ -431,6 +492,7 @@ static int usb_chg_plugged_in(struct pm8921_bms_chip *chip)
 	return val;
 }
 
+#if !defined(CONFIG_LGE_PM_EXT_GAUGE)
 static void pm8921_bms_low_voltage_config(struct pm8921_bms_chip *chip,
 								int time_ms)
 {
@@ -565,7 +627,7 @@ static int pm8921_battery_gauge_alarm_notify(struct notifier_block *nb,
 
 	return 0;
 };
-
+#endif
 
 #define HOLD_OREG_DATA		BIT(1)
 static int pm_bms_lock_output_data(struct pm8921_bms_chip *chip)
@@ -877,6 +939,8 @@ static int ocv_ir_compensation(struct pm8921_bms_chip *chip, int ocv)
 	compensated_ocv = ocv + div_s64((s64)ibatt_ua * rbatt_mohm, 1000);
 	pr_debug("comp ocv = %d, ocv = %d, ibatt_ua = %d, rbatt_mohm = %d\n",
 			compensated_ocv, ocv, ibatt_ua, rbatt_mohm);
+    printk("[BMS][ocv_ir_compensation] comp ocv = %d, ocv = %d, ibatt_ua = %d, rbatt_mohm = %d\n",
+			compensated_ocv, ocv, ibatt_ua, rbatt_mohm);
 
 	pm_bms_masked_write(chip, BMS_TEST1, SEL_ALT_OREG_BIT, 0);
 	return compensated_ocv;
@@ -918,7 +982,12 @@ static int estimate_ocv(struct pm8921_bms_chip *chip)
 	}
 
 	ocv_est_uv = vbat_uv + (ibat_ua * rbatt_mohm) / 1000;
+#ifdef CONFIG_MACH_APQ8064_AWIFI
+	pr_info("estimated pon ocv = %d, uv = %u, ua = %u, rbatt = %d\n",
+	ocv_est_uv,	vbat_uv, ibat_ua, rbatt_mohm);
+#else
 	pr_debug("estimated pon ocv = %d\n", ocv_est_uv);
+#endif
 	return ocv_est_uv;
 }
 
@@ -927,6 +996,9 @@ static bool is_warm_restart(struct pm8921_bms_chip *chip)
 	u8 reg;
 	int rc;
 
+#ifdef CONFIG_MACH_APQ8064_AWIFI
+    if (chip->warm_restart_flag) return 1;
+#endif
 	rc = pm8xxx_readb(chip->dev->parent, PON_CNTRL_6, &reg);
 	if (rc) {
 		pr_err("err reading pon 6 rc = %d\n", rc);
@@ -1035,8 +1107,13 @@ static int read_soc_params_raw(struct pm8921_bms_chip *chip,
 				int batt_temp_decidegc)
 {
 	int usb_chg;
-	int est_ocv_uv;
+	int est_ocv_uv=0;
 
+//#ifdef CONFIG_MACH_APQ8064_AWIFI
+#if 1 // Adapt this algorithm BMS using all model hglee 201403226 
+	int est_ocv_uv_T[3]={0,0,0};
+	int est_cnt=0;
+#endif
 	mutex_lock(&chip->bms_output_lock);
 	pm_bms_lock_output_data(chip);
 
@@ -1058,6 +1135,10 @@ static int read_soc_params_raw(struct pm8921_bms_chip *chip,
 		raw->last_good_ocv_uv = ocv_ir_compensation(chip,
 						raw->last_good_ocv_uv);
 		chip->last_ocv_uv = raw->last_good_ocv_uv;
+#ifdef CONFIG_MACH_APQ8064_AWIFI
+		pr_info("DELTA_VOLT):pmic=%u  sbl=%u\n", chip->last_ocv_uv/1000,chip->volt_from_sbl3);
+//		pr_info("DELTA_VOLT):%d  0x%x   0x%x\n",is_warm_restart(chip),raw->cc,raw->last_good_ocv_uv);
+#endif
 
 		if (is_warm_restart(chip)
 			|| raw->cc > CC_RAW_5MAH
@@ -1072,12 +1153,50 @@ static int read_soc_params_raw(struct pm8921_bms_chip *chip,
 			 * charging in the bootloader
 			 * - reset the CC and take an ocv again
 			 */
-			pr_debug("cc_raw = 0x%x may be > 5mAh(0x%x)\n",
+			pr_info("cc_raw = 0x%x may be > 5mAh(0x%x)\n",
 				       raw->cc,	CC_RAW_5MAH);
-			pr_debug("ocv_uv = %d ocv_raw = 0x%x may be < 2V\n",
+			pr_info("ocv_uv = %d ocv_raw = 0x%x may be < 2V\n",
 				       chip->last_ocv_uv,
 				       raw->last_good_ocv_raw);
+//#ifdef CONFIG_MACH_APQ8064_AWIFI
+#if 1 // Adapt this algorithm BMS using all model, hglee 201403226
+			for(est_cnt=0;est_cnt<3;est_cnt++)
+			{
+				msleep(100);
+				est_ocv_uv_T[est_cnt] = estimate_ocv(chip);
+				pr_info("est_ocv_uv[%d] = %d\n", est_cnt, est_ocv_uv_T[est_cnt]);
+			}
+
+			if(est_ocv_uv_T[0] && est_ocv_uv_T[1] && est_ocv_uv_T[2])
+			{
+				if(est_ocv_uv_T[0] > est_ocv_uv_T[1]) est_ocv_uv = est_ocv_uv_T[1];
+				else est_ocv_uv = est_ocv_uv_T[0];
+				if(est_ocv_uv > est_ocv_uv_T[2]) est_ocv_uv = est_ocv_uv_T[2];
+			}
+
+#else
 			est_ocv_uv = estimate_ocv(chip);
+#endif
+
+//lge_update
+#ifdef CONFIG_MACH_APQ8064_AWIFI
+       if(chip->warm_restart_flag==0)
+       {
+			printk("DELTA_VOLT):est_ocv_uv=%u  sbl=%u\n",est_ocv_uv/1000,chip->volt_from_sbl3);
+			if((est_ocv_uv/1000) > (chip->volt_from_sbl3 + 70))
+			{
+				pr_info("est_ocv_uv is Too High than sbl3\n");
+				est_ocv_uv = (chip->volt_from_sbl3 + 20)*1000;
+				//shutdown_soc_invalid = 1; //????
+			}
+			else if ((est_ocv_uv/1000) < (chip->volt_from_sbl3))
+			{
+				pr_info("est_ocv_uv is lower than sbl3 volt.\n");
+				est_ocv_uv = (chip->volt_from_sbl3)*1000;
+			}
+       }
+#endif
+
 			if (est_ocv_uv > 0) {
 				raw->last_good_ocv_uv = est_ocv_uv;
 				chip->last_ocv_uv = est_ocv_uv;
@@ -1087,6 +1206,7 @@ static int read_soc_params_raw(struct pm8921_bms_chip *chip,
 		}
 		chip->last_ocv_temp_decidegc = batt_temp_decidegc;
 		pr_debug("PON_OCV_UV = %d\n", chip->last_ocv_uv);
+        printk("[BMS] PON_OCV_UV = %d\n", chip->last_ocv_uv);
 	} else if (chip->prev_last_good_ocv_raw != raw->last_good_ocv_raw) {
 		chip->prev_last_good_ocv_raw = raw->last_good_ocv_raw;
 		convert_vbatt_raw_to_uv(chip, usb_chg,
@@ -1424,11 +1544,19 @@ static void calculate_iavg_ua(struct pm8921_bms_chip *chip, int cc_uah,
 		goto out;
 	}
 
+#ifdef CONFIG_LGE_PM_LOW_BATTERY_VOLTAGE_SOC_CAL_TIME
+	/* use the previous iavg if called within 5 seconds */
+	if (delta_time_s < 5) {
+		*iavg_ua = chip->prev_iavg_ua;
+		goto out;
+	}
+#else
 	/* use the previous iavg if called within 15 seconds */
 	if (delta_time_s < 15) {
 		*iavg_ua = chip->prev_iavg_ua;
 		goto out;
 	}
+#endif
 
 	delta_cc_uah = cc_uah - chip->last_cc_uah;
 
@@ -1446,6 +1574,9 @@ out:
 #define IAVG_SAMPLES 16
 #define MIN_IAVG_MA 250
 #define MIN_SECONDS_FOR_VALID_SAMPLE	20
+#ifdef CONFIG_LGE_PM_BMS_MIN_IAVG_CAL_TIME
+#define MIN_IAVG_CAL_TIME 20
+#endif
 static int calculate_unusable_charge_uah(struct pm8921_bms_chip *chip,
 				int rbatt, int fcc_uah, int cc_uah,
 				int soc_rbatt, int batt_temp, int chargecycles,
@@ -1460,6 +1591,10 @@ static int calculate_unusable_charge_uah(struct pm8921_bms_chip *chip,
 	static int firsttime = 1;
 	int pc_unusable;
 
+#ifdef CONFIG_LGE_PM_BMS_MIN_IAVG_CAL_TIME
+    int time_since_last_iavg_cal = 0;
+    unsigned long now_tm_sec = 0;
+#endif
 	/*
 	 * if we are called first time fill all the
 	 * samples with the the shutdown_iavg_ua
@@ -1473,6 +1608,17 @@ static int calculate_unusable_charge_uah(struct pm8921_bms_chip *chip,
 		iavg_index = 0;
 		iavg_num_samples = IAVG_SAMPLES;
 	}
+    
+#ifdef CONFIG_LGE_PM_BMS_MIN_IAVG_CAL_TIME
+        get_current_time(&now_tm_sec);
+        time_since_last_iavg_cal = now_tm_sec - chip->last_iavg_cal_time;
+        pr_debug("[BMS_DEBUG] chip->last_iavg_cal_time = %ld, time_since_last_iavg_cal = %d\n",
+             chip->last_iavg_cal_time, time_since_last_iavg_cal);
+        if( (time_since_last_iavg_cal < MIN_IAVG_CAL_TIME) && !firsttime){
+            goto out;
+        }
+        get_current_time(&chip->last_iavg_cal_time);
+#endif
 
 	/*
 	 * if we are charging use a nominal avg current so that we keep
@@ -1517,7 +1663,15 @@ static int calculate_unusable_charge_uah(struct pm8921_bms_chip *chip,
 	chip->prev_uuc_iavg_ma = iavg_ma;
 
 	firsttime = 0;
+#ifdef CONFIG_LGE_PM_BMS_MIN_IAVG_CAL_TIME
+	chip->last_uuc_uah_iavg = uuc_uah_iavg;
+#endif
 	return uuc_uah_iavg;
+#ifdef CONFIG_LGE_PM_BMS_MIN_IAVG_CAL_TIME
+	out:
+	return chip->last_uuc_uah_iavg;
+#endif
+
 }
 
 /* calculate remainging charge at the time of ocv */
@@ -1555,18 +1709,18 @@ static void calculate_soc_params(struct pm8921_bms_chip *chip,
 		delta_time_s = 0;
 	}
 	*fcc_uah = calculate_fcc_uah(chip, batt_temp, chargecycles);
-	pr_debug("FCC = %uuAh batt_temp = %d, cycles = %d\n",
+	pr_info("FCC = %uuAh batt_temp = %d, cycles = %d ",
 					*fcc_uah, batt_temp, chargecycles);
 
 
 	/* calculate remainging charge */
 	*remaining_charge_uah = calculate_remaining_charge_uah(chip, raw,
 					*fcc_uah, batt_temp, chargecycles);
-	pr_debug("RC = %uuAh\n", *remaining_charge_uah);
+	printk("RC = %uuAh ", *remaining_charge_uah);
 
 	/* calculate cc micro_volt_hour */
 	calculate_cc_uah(chip, raw->cc, cc_uah);
-	pr_debug("cc_uah = %duAh raw->cc = %x\n", *cc_uah, raw->cc);
+	printk("cc_uah = %duAh raw->cc = %x ", *cc_uah, raw->cc);
 
 	soc_rbatt = ((*remaining_charge_uah - *cc_uah) * 100) / *fcc_uah;
 	if (soc_rbatt < 0)
@@ -1579,7 +1733,7 @@ static void calculate_soc_params(struct pm8921_bms_chip *chip,
 					*fcc_uah, *cc_uah, soc_rbatt,
 					batt_temp, chargecycles, *iavg_ua,
 					delta_time_s);
-	pr_debug("UUC = %uuAh\n", *unusable_charge_uah);
+	printk("UUC = %uuAh\n", *unusable_charge_uah);
 }
 
 int pm8921_bms_get_simultaneous_battery_voltage_and_current(int *ibat_ua,
@@ -1814,6 +1968,7 @@ static int charging_adjustments(struct pm8921_bms_chip *chip,
 static void very_low_voltage_check(struct pm8921_bms_chip *chip,
 					int ibat_ua, int vbat_uv)
 {
+#if !defined(CONFIG_LGE_PM_EXT_GAUGE)
 	int rc;
 	/*
 	 * if battery is very low (v_cutoff voltage + 20mv) hold
@@ -1824,6 +1979,9 @@ static void very_low_voltage_check(struct pm8921_bms_chip *chip,
 		pr_debug("voltage = %d low holding wakelock\n", vbat_uv);
 		wake_lock(&chip->low_voltage_wake_lock);
 		chip->soc_calc_period = chip->low_voltage_calc_ms;
+#ifdef  CONFIG_LGE_PM_LOW_BATTERY_VOLTAGE_SOC_CAL_TIME
+        triggered_very_low_voltage = 1;
+#endif
 	}
 
 	if (vbat_uv > (chip->alarm_low_mv + 20 + BATT_ALARM_ACCURACY) * 1000
@@ -1831,11 +1989,15 @@ static void very_low_voltage_check(struct pm8921_bms_chip *chip,
 		pr_debug("voltage = %d releasing wakelock\n", vbat_uv);
 		chip->vbatt_cutoff_count = 0;
 		chip->soc_calc_period = chip->normal_voltage_calc_ms;
+#ifdef  CONFIG_LGE_PM_LOW_BATTERY_VOLTAGE_SOC_CAL_TIME
+        triggered_very_low_voltage = 0;
+#endif
 		rc = pm8921_bms_enable_batt_alarm(chip);
 		if (rc)
 			pr_err("Unable to enable batt alarm\n");
 		wake_unlock(&chip->low_voltage_wake_lock);
 	}
+#endif
 }
 
 static bool is_voltage_below_cutoff_window(struct pm8921_bms_chip *chip,
@@ -1856,6 +2018,12 @@ static bool is_voltage_below_cutoff_window(struct pm8921_bms_chip *chip,
 }
 
 static int last_soc_est = -EINVAL;
+#ifdef CONFIG_LGE_PM
+  /* In  95~100 percent during charged, We do not used  function charging_adjustments
+     * Cause of, before EOC, retained 99%.
+     */
+#define BMS_SOC_LEVEL_95 95
+#endif
 static int adjust_soc(struct pm8921_bms_chip *chip, int soc,
 		int batt_temp, int chargecycles,
 		int rbatt, int fcc_uah, int uuc_uah, int cc_uah)
@@ -1894,8 +2062,20 @@ static int adjust_soc(struct pm8921_bms_chip *chip, int soc,
 	delta_ocv_uv_limit = DIV_ROUND_CLOSEST(ibat_ua, 1000);
 
 	ocv_est_uv = vbat_uv + (ibat_ua * rbatt)/1000;
+#ifdef CONFIG_MACH_APQ8064_AWIFI
+	pr_debug("ocv_est_uv = %u, uv = %u, ua = %u, rbatt = %d\n",
+		ocv_est_uv, vbat_uv,ibat_ua, rbatt);
+#endif
 	calc_current_max(chip, ocv_est_uv, rbatt);
 	pc_est = calculate_pc(chip, ocv_est_uv, batt_temp, last_chargecycles);
+#ifndef CONFIG_LGE_PM
+	/* avoid divide by zero */
+	if(fcc_uah == uuc_uah)
+	{
+		pr_debug("bms error, SOC adjustment skipped\n");
+		goto out;
+	}
+#endif
 	soc_est = div_s64((s64)fcc_uah * pc_est - uuc_uah*100,
 						(s64)fcc_uah - uuc_uah);
 	soc_est = bound_soc(soc_est);
@@ -1907,6 +2087,12 @@ static int adjust_soc(struct pm8921_bms_chip *chip, int soc,
 	}
 
 	if (ibat_ua < 0 && pm8921_is_batfet_closed()) {
+#ifndef CONFIG_LGE_PM
+	/* In  95~100 percent during charged, We do not used  function charging_adjustments
+	* Cause of, before EOC, retained 99%.
+	*/
+		if(soc < BMS_SOC_LEVEL_95)
+#endif
 		soc = charging_adjustments(chip, soc, vbat_uv, ibat_ua,
 				batt_temp, chargecycles,
 				fcc_uah, cc_uah, uuc_uah);
@@ -2020,12 +2206,22 @@ out:
 		ibat_ua, vbat_uv, ocv_est_uv, pc_est,
 		soc_est, n, delta_ocv_uv, chip->last_ocv_uv,
 		pc_new, soc_new, rbatt, m);
+   	printk("[BMS] ibat_ua = %d, vbat_uv = %d, ocv_est_uv = %d, pc_est = %d, "
+		"soc_est = %d, n = %d, delta_ocv_uv = %d, last_ocv_uv = %d, "
+		"pc_new = %d, soc_new = %d, rbatt = %d, m = %d\n",
+		ibat_ua, vbat_uv, ocv_est_uv, pc_est,
+		soc_est, n, delta_ocv_uv, chip->last_ocv_uv,
+		pc_new, soc_new, rbatt, m);
 
 	return soc;
 }
 
 #define IGNORE_SOC_TEMP_DECIDEG		50
+#ifdef CONFIG_LGE_PM_CHANGE_IAVG_STEP_SIZE
+#define IAVG_STEP_SIZE_MA	100
+#else
 #define IAVG_STEP_SIZE_MA	50
+#endif
 #define IAVG_START		600
 #define SOC_ZERO		0xFF
 static void backup_soc_and_iavg(struct pm8921_bms_chip *chip, int batt_temp,
@@ -2099,6 +2295,10 @@ static void read_shutdown_soc_and_iavg(struct pm8921_bms_chip *chip)
 			chip->shutdown_soc,
 			chip->shutdown_iavg_ua,
 			shutdown_soc_invalid);
+    printk("[BMS] shutdown_soc = %d shutdown_iavg = %d shutdown_soc_invalid = %d\n",
+			chip->shutdown_soc,
+			chip->shutdown_iavg_ua,
+			shutdown_soc_invalid);
 }
 
 #define SOC_CATCHUP_SEC_MAX		600
@@ -2162,6 +2362,9 @@ static bool is_shutdown_soc_within_limits(struct pm8921_bms_chip *chip, int soc)
 		pr_debug("rejecting shutdown soc = %d, soc = %d limit = %d\n",
 			chip->shutdown_soc, soc,
 			chip->shutdown_soc_valid_limit);
+        printk("[BMS] rejecting shutdown soc = %d, soc = %d limit = %d\n",
+			chip->shutdown_soc, soc,
+			chip->shutdown_soc_valid_limit);
 		shutdown_soc_invalid = 1;
 		return 0;
 	}
@@ -2169,6 +2372,49 @@ static bool is_shutdown_soc_within_limits(struct pm8921_bms_chip *chip, int soc)
 	return 1;
 }
 
+#ifdef LGE_REPORT_SOC_ONE
+/*
+* Last safe code for low volt under 5%.
+*/
+
+#if defined(CONFIG_MACH_APQ8064_GK_KR) || defined(CONFIG_MACH_APQ8064_GKATT) || defined(CONFIG_MACH_APQ8064_GKGLOBAL) || defined(CONFIG_MACH_APQ8064_OMEGAR_KR) || defined(CONFIG_MACH_APQ8064_OMEGA_KR) || defined(CONFIG_MACH_APQ8064_GV_KR)
+#define CUTOFF_SET		(3600000)
+#elif defined(CONFIG_MACH_APQ8064_AWIFI) 
+#define CUTOFF_SET		(3150000)
+#else 
+#define CUTOFF_SET		(3350000)
+#endif
+
+int LGE_Report_ONE(struct pm8921_bms_chip *chip, int SoC)
+{
+	static int vbatt_uV = 0;
+	static int off_cnt = 0 ;
+
+	get_battery_uvolts(chip, &vbatt_uV);
+	printk("vbatt_uV = %d\n", vbatt_uV);
+
+	if (vbatt_uV  > CUTOFF_SET)
+	{
+		off_cnt=0;
+		printk("Real SOC2 = %d\n", SoC);
+		return SoC;
+	}
+	else
+	{
+		if(off_cnt==0)
+		{
+			off_cnt++;
+			printk("Real SOC3 = %d\n", SoC);
+			return SoC;
+		}
+		else
+		{
+			printk("%s:Go Power Off vbatt = %d\n",__func__,vbatt_uV);
+			return 0; //return soc 0%
+		}
+	}
+}
+#endif
 static void update_power_supply(struct pm8921_bms_chip *chip)
 {
 	if (chip->batt_psy == NULL || chip->batt_psy < 0)
@@ -2359,6 +2605,10 @@ static int calculate_state_of_charge(struct pm8921_bms_chip *chip,
 	mutex_lock(&soc_invalidation_mutex);
 	shutdown_soc = chip->shutdown_soc;
 
+#ifdef CONFIG_MACH_APQ8064_AWIFI
+	if (firsttime)
+	pr_info("soc = %d before forcing shutdown_soc = %d\n",soc, shutdown_soc);
+#endif
 	if (firsttime && soc != shutdown_soc
 			&& is_shutdown_soc_within_limits(chip, soc)) {
 		/*
@@ -2368,6 +2618,13 @@ static int calculate_state_of_charge(struct pm8921_bms_chip *chip,
 		 */
 		pr_debug("soc = %d before forcing shutdown_soc = %d\n",
 							soc, shutdown_soc);
+#ifdef CONFIG_MACH_APQ8064_AWIFI
+		if(soc == 0  &&  (chip->volt_from_sbl3 < 3500))
+		{
+			shutdown_soc_invalid = 1;
+			goto skip_adjust;
+		}
+#endif
 		adjust_rc_and_uuc_for_specific_soc(
 						chip,
 						batt_temp, chargecycles,
@@ -2395,6 +2652,9 @@ static int calculate_state_of_charge(struct pm8921_bms_chip *chip,
 		pr_debug("DONE for shutdown_soc = %d soc is %d, adjusted ocv to %duV\n",
 				shutdown_soc, soc, chip->last_ocv_uv);
 	}
+#ifdef CONFIG_MACH_APQ8064_AWIFI
+	skip_adjust:
+#endif
 	mutex_unlock(&soc_invalidation_mutex);
 
 	pr_debug("SOC before adjustment = %d\n", soc);
@@ -2418,11 +2678,16 @@ static int calculate_state_of_charge(struct pm8921_bms_chip *chip,
 			pm8921_bms_start_ocv_updates();
 		}
 	}
+
+    
+    printk("[BMS] New_cal_SOC = %d, SOC = %d, batt_temp = %d, rbatt = %d, fcc_uah = %d, ocv_charge_uah = %d, uuc_uah = %d, cc_uah = %d, iavg_ua = %d\n",
+           new_calculated_soc, soc, batt_temp, rbatt, fcc_uah, remaining_charge_uah, unusable_charge_uah, cc_uah, iavg_ua);
 	return calculated_soc;
 }
 
 static int recalculate_soc(struct pm8921_bms_chip *chip)
 {
+#if !defined(CONFIG_LGE_PM_EXT_GAUGE)
 	int batt_temp;
 	struct pm8921_soc_params raw;
 	int soc;
@@ -2439,8 +2704,18 @@ static int recalculate_soc(struct pm8921_bms_chip *chip)
 	mutex_unlock(&chip->last_ocv_uv_mutex);
 	wake_unlock(&the_chip->soc_wake_lock);
 	return soc;
+#else
+	return 88;
+#endif
 }
 
+#ifdef  CONFIG_LGE_PM_LOW_BATTERY_VOLTAGE_SOC_CAL_TIME
+#define LOW_BATTERY_VOLTAGE_THRESOLD 100
+#define LOW_BATTERY_VOLTAGE_SOC_CAL_TIME 5000
+#endif
+#ifdef CONFIG_LGE_PM_BATTERY_SOC_RESCALING
+static int bms_long_time_sleep = 0;
+#endif
 static void calculate_soc_work(struct work_struct *work)
 {
 	struct delayed_work *dwork = to_delayed_work(work);
@@ -2448,19 +2723,84 @@ static void calculate_soc_work(struct work_struct *work)
 				struct pm8921_bms_chip,
 				calculate_soc_delayed_work);
 
+#ifdef  CONFIG_LGE_PM_LOW_BATTERY_VOLTAGE_SOC_CAL_TIME
+    int vbat_uv = 0;
+    int low_battery_voltage_mv = 0;
+#endif
+
 	recalculate_soc(chip);
-	schedule_delayed_work(&chip->calculate_soc_delayed_work,
-			round_jiffies_relative(msecs_to_jiffies
-			(chip->soc_calc_period)));
+
+#ifdef CONFIG_LGE_PM_BATTERY_SOC_RESCALING
+        bms_long_time_sleep = 0;
+#endif
+#ifdef  CONFIG_LGE_PM_LOW_BATTERY_VOLTAGE_SOC_CAL_TIME
+    get_battery_uvolts(chip, &vbat_uv);
+
+    low_battery_voltage_mv = chip->v_cutoff + LOW_BATTERY_VOLTAGE_THRESOLD;
+
+    if((vbat_uv/1000 < low_battery_voltage_mv) && !triggered_very_low_voltage){
+        schedule_delayed_work(&chip->calculate_soc_delayed_work,
+			msecs_to_jiffies(LOW_BATTERY_VOLTAGE_SOC_CAL_TIME));
+    }else{
+        schedule_delayed_work(&chip->calculate_soc_delayed_work,
+            round_jiffies_relative(msecs_to_jiffies
+                (chip->soc_calc_period)));
+    }
+#else
+#if !defined(CONFIG_LGE_PM_EXT_GAUGE)
+       schedule_delayed_work(&chip->calculate_soc_delayed_work,
+                       round_jiffies_relative(msecs_to_jiffies
+                       (chip->soc_calc_period)));
+#endif
+#endif
 }
 
+#ifdef CONFIG_LGE_PM
+/* Rescaling SoC. */
+#define RESCAL_101	101
+#define RESCAL_103	103
+#define RESCAL_104	104
+#endif
+
+#ifdef CONFIG_LGE_PM_BATTERY_SOC_RESCALING
+static int cntSOC = 0;
+int cal_rnd_avg(int *soc_value, int unit_num)
+{
+	 int sum = 0;
+	 int avr = 0;
+	 int i;
+
+	 for(i = 0; i < unit_num; i++){
+		sum += soc_value[i];
+        pr_debug("average soc[%d] = %d\n", i, soc_value[i]);
+	 }
+
+	 avr = ((sum/unit_num)*10+5)/10;
+
+	 return avr;
+}
+#endif
+
+#ifdef CONFIG_LGE_PM_BATTERY_SOC_RESCALING
+#define SOC_RESCALING_FACTOR	100/94
+#define I_MAX 10 /*numner of SOC averaging unit*/
+#define MAX_SLEEP_AVG_CAL_TIME  120
+#endif
 static int report_state_of_charge(struct pm8921_bms_chip *chip)
 {
 	int soc = calculated_soc;
 	int delta_time_us;
 	struct timespec now;
 	int batt_temp;
-
+#ifdef CONFIG_LGE_PM_BATTERY_SOC_RESCALING
+        static int  soc_buf[I_MAX]={0,};
+        static int  idxBuf = 0;
+        int         idxsoc = 0;
+        int         avgSOC = 0;
+        unsigned long current_time = 0;
+        int         time_since_last_rescale_soc_sec = 0;
+#endif
+	printk("report_soc : soc = %d, last_soc=%d\n", soc, last_soc);
 	if (bms_fake_battery != -EINVAL) {
 		pr_debug("Returning Fake SOC = %d%%\n", bms_fake_battery);
 		return bms_fake_battery;
@@ -2511,9 +2851,10 @@ static int report_state_of_charge(struct pm8921_bms_chip *chip)
 	}
 
 	/* last_soc < soc  ... scale and catch up */
-	if (last_soc != -EINVAL && last_soc < soc)
+	if (last_soc != -EINVAL && last_soc < soc && soc != 100)
 		soc = scale_soc_while_chg(chip, delta_time_us, soc, last_soc);
 
+	/* restrict soc to 1% change */
 	if (last_soc != -EINVAL) {
 		if (chip->first_report_after_suspend) {
 			chip->first_report_after_suspend = false;
@@ -2540,11 +2881,121 @@ static int report_state_of_charge(struct pm8921_bms_chip *chip)
 	}
 
 	last_soc = bound_soc(soc);
+
 	backup_soc_and_iavg(chip, batt_temp, last_soc);
-	pr_debug("Reported SOC = %d\n", last_soc);
+	pr_info("Reported SOC = %d vbat=%d chg_mode=%d\n", last_soc,g_vbat_meas_uv,chip->chg_logo_mode);
 	chip->t_soc_queried = now;
 
-	return last_soc;
+#ifdef CONFIG_LGE_PM_BATTERY_SOC_RESCALING
+        chip->rescale_soc = last_soc*SOC_RESCALING_FACTOR;
+        if(chip->rescale_soc > 100)
+            chip->rescale_soc = 100;
+
+        // average of last 10 measured comp_soc value
+        if (cntSOC == 0){//access once
+            if(bms_long_time_sleep != 1){
+                for(idxsoc=0; idxsoc<I_MAX; idxsoc++){
+                    soc_buf[idxsoc] = chip->rescale_soc;
+                }
+                avgSOC = chip->rescale_soc;
+                cntSOC = I_MAX;
+                idxBuf = 1;
+                get_current_time(&chip->last_rescale_soc_time);
+                pr_debug("[first cal avg soc] get_current_time = %lu\n", chip->last_rescale_soc_time);
+            }
+        }else{
+            if (idxBuf >= I_MAX){
+                idxBuf = 0;
+            }
+            get_current_time(&current_time);
+            time_since_last_rescale_soc_sec = current_time - chip->last_rescale_soc_time;
+            if( (abs(time_since_last_rescale_soc_sec) > 1)&&
+                (abs(time_since_last_rescale_soc_sec) < MAX_SLEEP_AVG_CAL_TIME) ){
+                soc_buf[idxBuf] = chip->rescale_soc;
+                idxBuf++;
+                get_current_time(&chip->last_rescale_soc_time);
+                pr_debug("[add avg soc] get_current_time = %lu, since = %d\n", chip->last_rescale_soc_time, time_since_last_rescale_soc_sec);
+            }else if(abs(time_since_last_rescale_soc_sec) >= MAX_SLEEP_AVG_CAL_TIME){
+                cntSOC = 0;
+                bms_long_time_sleep = 1;
+                schedule_work(&(chip->calculate_soc_delayed_work.work));
+                pr_debug("[BMS Sleep long time] time_since_last_rescale_soc_sec = %d\n", time_since_last_rescale_soc_sec);
+            }
+        }
+        avgSOC = cal_rnd_avg(soc_buf, I_MAX);
+        chip->rescale_soc = avgSOC;
+#endif
+
+#if defined (CONFIG_MACH_APQ8064_AWIFI)
+	if(chip->chg_logo_mode == 0)
+	{
+		if(soc > 0 && (g_vbat_meas_uv && g_vbat_meas_uv < CUTOFF_SET))
+		{
+			return LGE_Report_ONE(chip,soc);
+		}
+	}
+	else
+	{
+	    static int low_batt_check_flag=1;
+
+		if(!g_vbat_meas_uv)
+		{
+			g_vbat_meas_uv = chip->volt_from_sbl3*1000;
+
+			if(g_vbat_meas_uv > 3400000)
+			{
+		      low_batt_check_flag=0;
+			  printk("[BMS]low_batt_check_flag to = %d\n",low_batt_check_flag);
+			}
+		}
+		if(g_vbat_meas_uv <= 3650000 && low_batt_check_flag)// && check_low_bat)
+		{
+			if(g_vbat_meas_uv <= 3400000 && low_batt_check_flag == 1 )
+			{
+				soc = 0;
+				last_soc =soc;
+			}
+			else
+			{
+				if (low_batt_check_flag ==1)
+				{
+				chip->prev_last_good_ocv_raw = OCV_RAW_UNINITIALIZED;
+				chip->warm_restart_flag = 1;
+
+				soc = 0;
+			    last_soc =soc;
+					low_batt_check_flag++;
+				printk("[BMS]Reset SoC = %d\n", soc);
+				}
+				else
+				{
+					if(low_batt_check_flag < 5)
+					{
+						soc=0;
+						low_batt_check_flag++;
+					}
+					else if(soc > 2) soc = 2;
+					last_soc=soc ;
+				}
+			}
+		}
+		else
+		{
+		//	printk("[BMS3]Return SoC = %d\n", soc);
+		  low_batt_check_flag = 0 ;
+		}
+		if(soc> 0 && soc <=20) soc--;
+	}
+
+#endif
+
+
+#ifdef CONFIG_LGE_PM_BATTERY_SOC_RESCALING
+    pr_info("[BMS_DEBUG] Rescale SOC = %d\n", chip->rescale_soc);
+    return chip->rescale_soc;
+#else
+    return last_soc;
+#endif
 }
 
 void pm8921_bms_battery_removed(void)
@@ -2618,7 +3069,13 @@ void pm8921_bms_invalidate_shutdown_soc(void)
 	struct pm8921_bms_chip *chip = the_chip;
 
 	/* clean up the fcc learning table */
+#ifdef CONFIG_LGE_PM
+	// Bug fix detected by WBT !!!
+	if (the_chip)
+#else
+	// QCT origin code have potential of BUG
 	if (!the_chip)
+#endif
 		the_chip->adjusted_fcc_temp_lut = NULL;
 	last_fcc_update_count = 0;
 	last_real_fcc_mah = -EINVAL;
@@ -2992,6 +3449,34 @@ void pm8921_bms_charging_end(int is_battery_full)
 }
 EXPORT_SYMBOL_GPL(pm8921_bms_charging_end);
 
+#ifdef BMS_SYSFS_RESET
+ssize_t bms_show_status(struct device *dev,
+                         struct device_attribute *attr,
+                         char *buf)
+{
+        if (the_chip == NULL)
+                return snprintf(buf, PAGE_SIZE, "ERROR\n");
+
+        return snprintf(buf, PAGE_SIZE, "reset\n");
+}
+ssize_t bms_store_status(struct device *dev,
+                          struct device_attribute *attr,
+                          const char *buf,
+                          size_t count)
+{
+        if (the_chip == NULL)
+                return -1;
+
+        if (strncmp(buf, "reset", 5) == 0) {
+			pr_debug("reset status was not use in BMS.\n");
+        } else {
+                return -1;
+        }
+        return count;
+}
+DEVICE_ATTR(state, 0664, bms_show_status, bms_store_status);
+#endif
+
 static irqreturn_t pm8921_bms_sbi_write_ok_handler(int irq, void *data)
 {
 	pr_debug("irq = %d triggered", irq);
@@ -3152,6 +3637,7 @@ static void check_initial_ocv(struct pm8921_bms_chip *chip)
 	}
 	chip->last_ocv_uv = ocv_uv;
 	pr_debug("ocv_uv = %d last_ocv_uv = %d\n", ocv_uv, chip->last_ocv_uv);
+    printk("[BMS][check_initial_ocv] ocv_uv = %d last_ocv_uv = %d\n", ocv_uv, chip->last_ocv_uv);
 }
 
 static int64_t read_battery_id(struct pm8921_bms_chip *chip)
@@ -3182,6 +3668,21 @@ static int set_battery_data(struct pm8921_bms_chip *chip)
 		goto desay;
 	else if (chip->batt_type == BATT_PALLADIUM)
 		goto palladium;
+#ifdef CONFIG_LGE_PM
+#ifdef CONFIG_MACH_APQ8064_AWIFI
+	else if (chip->batt_type == BATT_4600_LGE)
+		goto batt_4600_lge;
+#else
+	else if (chip->batt_type == BATT_LGE)
+		goto lge;
+	else if (chip->batt_type == BATT_1900_LGE)
+		goto batt_1900_lge;
+	else if (chip->batt_type == BATT_2100_LGE)
+		goto batt_2100_lge;
+	else if (chip->batt_type == BATT_2200_LGE)
+		goto batt_2200_lge;
+#endif
+#endif
 
 	battery_id = read_battery_id(chip);
 	if (battery_id < 0) {
@@ -3224,6 +3725,70 @@ desay:
 		chip->rbatt_capacitive_mohm
 			= desay_5200_data.rbatt_capacitive_mohm;
 		return 0;
+#ifdef CONFIG_LGE_PM
+#ifdef CONFIG_MACH_APQ8064_AWIFI
+batt_4600_lge:
+		chip->fcc = LGE_4600_PMH_data.fcc;
+		chip->fcc_temp_lut = LGE_4600_PMH_data.fcc_temp_lut;
+		chip->fcc_sf_lut = LGE_4600_PMH_data.fcc_sf_lut;
+		chip->pc_temp_ocv_lut = LGE_4600_PMH_data.pc_temp_ocv_lut;
+		chip->pc_sf_lut = LGE_4600_PMH_data.pc_sf_lut;
+		chip->rbatt_sf_lut = LGE_4600_PMH_data.rbatt_sf_lut;
+		chip->delta_rbatt_mohm = LGE_4600_PMH_data.delta_rbatt_mohm;
+		chip->default_rbatt_mohm
+				= LGE_4600_PMH_data.default_rbatt_mohm;
+		return 0;
+#else
+lge:
+		chip->fcc = lge_1900_data.fcc;
+		chip->fcc_temp_lut = lge_1900_data.fcc_temp_lut;
+		chip->fcc_sf_lut = lge_1900_data.fcc_sf_lut;
+		chip->pc_temp_ocv_lut = lge_1900_data.pc_temp_ocv_lut;
+		chip->pc_sf_lut = lge_1900_data.pc_sf_lut;
+		chip->rbatt_sf_lut = lge_1900_data.rbatt_sf_lut;
+		chip->delta_rbatt_mohm = lge_1900_data.delta_rbatt_mohm;
+		chip->default_rbatt_mohm
+				= lge_1900_data.default_rbatt_mohm;
+		return 0;
+
+batt_1900_lge:
+		chip->fcc = lge_1840_data.fcc;
+		chip->fcc_temp_lut = lge_1840_data.fcc_temp_lut;
+		chip->fcc_sf_lut = lge_1840_data.fcc_sf_lut;
+		chip->pc_temp_ocv_lut = lge_1840_data.pc_temp_ocv_lut;
+		chip->pc_sf_lut = lge_1840_data.pc_sf_lut;
+		chip->rbatt_sf_lut = lge_1840_data.rbatt_sf_lut;
+		chip->delta_rbatt_mohm = lge_1840_data.delta_rbatt_mohm;
+		chip->default_rbatt_mohm
+				= lge_1840_data.default_rbatt_mohm;
+		return 0;
+
+batt_2100_lge:
+		chip->fcc = LGE_2100_PMH_data.fcc;
+		chip->fcc_temp_lut = LGE_2100_PMH_data.fcc_temp_lut;
+		chip->fcc_sf_lut = LGE_2100_PMH_data.fcc_sf_lut;
+		chip->pc_temp_ocv_lut = LGE_2100_PMH_data.pc_temp_ocv_lut;
+		chip->pc_sf_lut = LGE_2100_PMH_data.pc_sf_lut;
+		chip->rbatt_sf_lut = LGE_2100_PMH_data.rbatt_sf_lut;
+		chip->delta_rbatt_mohm = LGE_2100_PMH_data.delta_rbatt_mohm;
+		chip->default_rbatt_mohm
+				= LGE_2100_PMH_data.default_rbatt_mohm;
+		return 0;
+
+batt_2200_lge:
+		chip->fcc = LGE_2200_PMH_data.fcc;
+		chip->fcc_temp_lut = LGE_2200_PMH_data.fcc_temp_lut;
+		chip->fcc_sf_lut = LGE_2200_PMH_data.fcc_sf_lut;
+		chip->pc_temp_ocv_lut = LGE_2200_PMH_data.pc_temp_ocv_lut;
+		chip->pc_sf_lut = LGE_2200_PMH_data.pc_sf_lut;
+		chip->rbatt_sf_lut = LGE_2200_PMH_data.rbatt_sf_lut;
+		chip->delta_rbatt_mohm = LGE_2200_PMH_data.delta_rbatt_mohm;
+		chip->default_rbatt_mohm
+				= LGE_2200_PMH_data.default_rbatt_mohm;
+		return 0;
+#endif
+#endif
+
 }
 
 enum bms_request_operation {
@@ -3671,6 +4236,23 @@ restore_sbi_config:
 	return 0;
 }
 
+#ifdef CONFIG_MACH_APQ8064_AWIFI
+/* sbl3 battery voltage status */
+unsigned int pm8921_get_battery_voltage_sbl3(void)
+{
+	unsigned int smem_size;
+	unsigned int *batt_volt;
+
+	batt_volt = smem_get_entry(SMEM_ID_VENDOR2, &smem_size);
+	if(smem_size==0 || !batt_volt)
+	{
+		return -EFAULT;
+	}
+
+	//pr_debug("smem battery_threshold=%d, weak=%d\n", (0xffff & *batt_weak), !!(0xffff0000 & *batt_weak));
+	return *batt_volt;
+}
+#endif
 static int __devinit pm8921_bms_probe(struct platform_device *pdev)
 {
 	int rc = 0;
@@ -3678,7 +4260,9 @@ static int __devinit pm8921_bms_probe(struct platform_device *pdev)
 	struct pm8921_bms_chip *chip;
 	const struct pm8921_bms_platform_data *pdata
 				= pdev->dev.platform_data;
-
+#ifdef CONFIG_MACH_APQ8064_AWIFI
+	unsigned int volt_temp;
+#endif
 	if (!pdata) {
 		pr_err("missing platform data\n");
 		return -EINVAL;
@@ -3707,10 +4291,15 @@ static int __devinit pm8921_bms_probe(struct platform_device *pdev)
 	chip->shutdown_soc_valid_limit = pdata->shutdown_soc_valid_limit;
 	chip->adjust_soc_low_threshold = pdata->adjust_soc_low_threshold;
 
+#if !defined(CONFIG_LGE_PM_EXT_GAUGE)
 	chip->normal_voltage_calc_ms = pdata->normal_voltage_calc_ms;
 	chip->low_voltage_calc_ms = pdata->low_voltage_calc_ms;
-
 	chip->soc_calc_period = pdata->normal_voltage_calc_ms;
+#else
+	chip->normal_voltage_calc_ms = 10*60000;
+	chip->low_voltage_calc_ms = 10*60000;
+	chip->soc_calc_period = 10*60000;
+#endif
 
 	if (chip->adjust_soc_low_threshold >= 45)
 		chip->adjust_soc_low_threshold = 45;
@@ -3771,6 +4360,16 @@ static int __devinit pm8921_bms_probe(struct platform_device *pdev)
 			goto free_chip;
 		}
 	}
+#ifdef LGE_BMS_DEBUG
+	dbg("BMS initial data...\n");
+	dbg("r_sense = %d\n", chip->r_sense_uohm);
+	dbg("v_cutoff = %d\n", chip->v_cutoff);
+	dbg("max_voltage_uv = %d\n", chip->max_voltage_uv);
+	dbg("batt_type = %d\n", chip->batt_type);
+	dbg("revision = 0x%x\n", chip->revision);
+	dbg("default rbatt = %d\n", chip->default_rbatt_mohm);
+	dbg("rconn_mohm = %d\n", chip->rconn_mohm);
+#endif
 
 	chip->disable_flat_portion_ocv = pdata->disable_flat_portion_ocv;
 	chip->ocv_dis_high_soc = pdata->ocv_dis_high_soc;
@@ -3785,7 +4384,34 @@ static int __devinit pm8921_bms_probe(struct platform_device *pdev)
 	chip->alarm_high_mv = pdata->alarm_high_mv;
 	chip->low_voltage_detect = pdata->low_voltage_detect;
 	chip->vbatt_cutoff_retries = pdata->vbatt_cutoff_retries;
+#ifdef CONFIG_LGE_PM
+	/* checked chargerlogo mode */
+	chip->chg_logo_mode = lge_get_charger_logo_state();
 
+    printk("BMS initial data...\n");
+	printk("r_sense = %d\n", chip->r_sense_uohm);
+	printk("v_cutoff = %d\n", chip->v_cutoff);
+	printk("max_voltage_uv = %d\n", chip->max_voltage_uv);
+	printk("batt_type = %d\n", chip->batt_type);
+	printk("revision = 0x%x\n", chip->revision);
+	printk("default rbatt = %d\n", chip->default_rbatt_mohm);
+	printk("rconn_mohm = %d\n", chip->rconn_mohm);
+    printk("disable_flat_portion_ocv = %d\n", chip->disable_flat_portion_ocv);
+    printk("ocv_dis_high_soc = %d\n", chip->ocv_dis_high_soc);
+    printk("ocv_dis_low_soc = %d\n", chip->ocv_dis_low_soc);
+    printk("high_ocv_correction_limit_uv = %d\n", chip->high_ocv_correction_limit_uv);
+    printk("low_ocv_correction_limit_uv = %d\n", chip->low_ocv_correction_limit_uv);
+    printk("low_voltage_detect = %d\n", chip->low_voltage_detect);
+    printk("alarm_low_mv = %d\n", chip->alarm_low_mv);
+    printk("alarm_high_mv = %d\n", chip->alarm_high_mv);
+    printk("vbatt_cutoff_retries  = %d\n", chip->vbatt_cutoff_retries );   
+
+#endif
+#ifdef CONFIG_MACH_APQ8064_AWIFI
+	volt_temp = pm8921_get_battery_voltage_sbl3();
+	chip->volt_from_sbl3 = volt_temp &= 0xffff;
+	chip->warm_restart_flag =0;
+#endif
 	mutex_init(&chip->calib_mutex);
 	INIT_WORK(&chip->calib_hkadc_work, calibrate_hkadc_work);
 
@@ -3814,18 +4440,30 @@ static int __devinit pm8921_bms_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, chip);
 	the_chip = chip;
 	create_debugfs_entries(chip);
-
+#ifdef BMS_SYSFS_RESET
+	rc = device_create_file(&pdev->dev, &dev_attr_state);
+	if (rc) {
+		pr_err("couldn't make file dev_attr_state rc = %d\n", rc);
+		goto free_status;
+	}
+#endif
 	rc = read_ocv_trim(chip);
 	if (rc) {
 		pr_err("couldn't adjust ocv_trim rc= %d\n", rc);
 		goto free_irqs;
 	}
 	check_initial_ocv(chip);
+#ifdef LGE_BMS_DEBUG
+	dbg("ocv battery = %d\n", chip->last_ocv_uv);
+#endif
 
+#if !defined(CONFIG_LGE_PM_EXT_GAUGE)
 	/* enable the vbatt reading interrupts for scheduling hkadc calib */
 	pm8921_bms_enable_irq(chip, PM8921_BMS_GOOD_OCV);
 	pm8921_bms_enable_irq(chip, PM8921_BMS_OCV_FOR_R);
+#endif
 
+#if !defined(CONFIG_LGE_PM_EXT_GAUGE)
 	rc = pm8921_bms_configure_batt_alarm(chip);
 	if (rc) {
 		pr_err("Couldn't configure battery alarm! rc=%d\n", rc);
@@ -3837,6 +4475,7 @@ static int __devinit pm8921_bms_probe(struct platform_device *pdev)
 		pr_err("Couldn't enable battery alarm! rc=%d\n", rc);
 		goto free_irqs;
 	}
+#endif
 
 	calculate_soc_work(&(chip->calculate_soc_delayed_work.work));
 
@@ -3848,11 +4487,19 @@ static int __devinit pm8921_bms_probe(struct platform_device *pdev)
 	else
 		pr_info("Unable to read battery voltage at boot\n");
 
+#ifdef CONFIG_LGE_PM_BMS_MIN_IAVG_CAL_TIME
+        get_current_time(&chip->last_iavg_cal_time);
+#endif
+
 	return 0;
 
 free_irqs:
 	wake_lock_destroy(&chip->low_voltage_wake_lock);
 	free_irqs(chip);
+#ifdef BMS_SYSFS_RESET
+free_status:
+	device_remove_file(&pdev->dev, &dev_attr_state);
+#endif
 destroy_soc_wl:
 	wake_lock_destroy(&chip->soc_wake_lock);
 free_chip:
@@ -3868,6 +4515,9 @@ static int __devexit pm8921_bms_remove(struct platform_device *pdev)
 	kfree(chip->adjusted_fcc_temp_lut);
 	platform_set_drvdata(pdev, NULL);
 	the_chip = NULL;
+#ifdef BMS_SYSFS_RESET
+	device_remove_file(&pdev->dev, &dev_attr_state);
+#endif
 	kfree(chip);
 	return 0;
 }
@@ -3885,6 +4535,7 @@ static int pm8921_bms_suspend(struct device *dev)
 
 static int pm8921_bms_resume(struct device *dev)
 {
+#if !defined(CONFIG_LGE_PM_EXT_GAUGE)
 	int rc;
 	unsigned long time_since_last_recalc;
 	unsigned long tm_now_sec;
@@ -3912,6 +4563,7 @@ static int pm8921_bms_resume(struct device *dev)
 	update_power_supply(chip);
 	schedule_delayed_work(&chip->calculate_soc_delayed_work,
 				msecs_to_jiffies(chip->soc_calc_period));
+#endif
 
 	return 0;
 }
