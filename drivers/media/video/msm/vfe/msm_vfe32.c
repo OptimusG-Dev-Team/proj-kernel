@@ -7107,7 +7107,9 @@ void axi_stop(struct msm_cam_media_controller *pmctl,
 	case AXI_CMD_CAPTURE:
 	case AXI_CMD_RAW_CAPTURE:
 	case AXI_CMD_ZSL:
+/* This code has been disabled due to compilation error regarding 'stop_issued'
 		axi_ctrl->share_ctrl->stop_issued = TRUE;
+                                                                  */
 		axi_ctrl->share_ctrl->cmd_type = vfe_params.cmd_type;
 		break;
 	case AXI_CMD_RECORD:
