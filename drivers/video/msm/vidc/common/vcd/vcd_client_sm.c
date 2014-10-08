@@ -1173,6 +1173,17 @@ static void vcd_clnt_cb_in_flushing
 				VCD_EVT_IND_HWERRFATAL,	status);
 			break;
 		}
+	case VCD_EVT_RESP_TRANSACTION_PENDING:
+		{
+			if (!cctxt->decoding) {
+				printk("\n%s: frame_submitted =  %u\n", __func__, cctxt->status.frame_submitted);
+			}
+			if (cctxt->status.frame_submitted)
+				cctxt->status.frame_submitted--;
+			vcd_mark_frame_channel(cctxt->dev_ctxt);
+			frm_trans_end = true;
+			break;
+		}
 	default:
 		{
 			VCD_MSG_ERROR
@@ -1183,6 +1194,9 @@ static void vcd_clnt_cb_in_flushing
 
 			break;
 		}
+	}
+	if (!cctxt->decoding) {
+		printk("\nSTART: rc = %u event = %x\n", rc, event);
 	}
 	if (!VCD_FAILED(rc) && ((event == VCD_EVT_RESP_INPUT_DONE ||
 		event == VCD_EVT_RESP_OUTPUT_DONE ||
@@ -1196,8 +1210,10 @@ static void vcd_clnt_cb_in_flushing
 			frm_trans_end = true;
 		}
 		if (frm_trans_end && !cctxt->status.frame_submitted) {
-			VCD_MSG_HIGH
-			    ("All pending frames recvd from DDL");
+			if (!cctxt->decoding) {
+				printk
+				    ("\nAll pending frames recvd from DDL\n");
+			}
 			if (cctxt->status.mask & VCD_FLUSH_INPUT)
 				vcd_flush_bframe_buffers(cctxt,
 							VCD_FLUSH_INPUT);
@@ -1205,12 +1221,38 @@ static void vcd_clnt_cb_in_flushing
 				vcd_flush_output_buffers(cctxt);
 			vcd_send_flush_done(cctxt, VCD_S_SUCCESS);
 			vcd_release_interim_frame_channels(dev_ctxt);
-			VCD_MSG_HIGH("Flush complete");
+			if (!cctxt->decoding) {
+				printk("\nFlush complete\n");
+			}
 			vcd_do_client_state_transition(cctxt,
 				VCD_CLIENT_STATE_RUN,
 				CLIENT_STATE_EVENT_NUMBER
 				(clnt_cb));
 		}
+	}
+	if (!cctxt->decoding) {
+		printk("\nEND: rc = %u event = %x\n", rc, event);
+	}
+	if (!VCD_FAILED(rc) && (event == VCD_EVT_RESP_TRANSACTION_PENDING)) {
+		if (!cctxt->decoding) {
+			printk("\nAssuming all pending frames recvd from DDL\n");
+			printk("\nframe_submitted = %u\n",
+							cctxt->status.frame_submitted);
+		}
+		if (cctxt->status.mask & VCD_FLUSH_INPUT)
+			vcd_flush_bframe_buffers(cctxt,
+						VCD_FLUSH_INPUT);
+		if (cctxt->status.mask & VCD_FLUSH_OUTPUT)
+			vcd_flush_output_buffers(cctxt);
+		vcd_send_flush_done(cctxt, VCD_S_SUCCESS);
+		vcd_release_interim_frame_channels(dev_ctxt);
+		if (!cctxt->decoding) {
+			printk("\nFlush complete\n");
+		}
+		vcd_do_client_state_transition(cctxt,
+			VCD_CLIENT_STATE_RUN,
+			CLIENT_STATE_EVENT_NUMBER
+			(clnt_cb));
 	}
 }
 

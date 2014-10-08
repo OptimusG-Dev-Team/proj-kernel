@@ -1,7 +1,4 @@
-/*
- *  LM3530 backlight device driver
- *
- *  Copyright (C) 2011-2012, LG Eletronics,Inc. All rights reservced.
+/* drivers/video/backlight/lm3530_bl.c
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -21,23 +18,43 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/platform_device.h>
-#include <linux/platform_data/lm35xx_bl.h>
 #include <linux/kernel.h>
 #include <linux/spinlock.h>
 #include <linux/backlight.h>
 #include <linux/fb.h>
 #include <linux/delay.h>
 #include <linux/gpio.h>
-#include <linux/mutex.h>
+#include <mach/board.h>
+#include <mach/board_lge.h>
+#include <linux/earlysuspend.h>
 
-#define I2C_BL_NAME             "lm3530"
 
-#define BL_ON                   1
-#define BL_OFF                  0
+#define MAX_LEVEL		0xFF	//255 out of 255(android)
+#define MIN_LEVEL 		0x6E	//110 out of 255(android)
+#define max_brightness_lm3530	0x7B //105 out of 125(cal value)
+#define min_brightness_lm3530	0x36
 
-static DEFINE_MUTEX(backlight_mtx);
+
+
+
+#define I2C_BL_NAME "lm3530"
+
+#define BL_ON	1
+#define BL_OFF	0
 
 static struct i2c_client *lm3530_i2c_client;
+
+struct backlight_platform_data {
+	void (*platform_init)(void);
+	int gpio;
+	unsigned int mode;
+	int max_current;
+	int init_on_boot;
+	int min_brightness;
+	int max_brightness;
+	int default_brightness;
+	int factory_brightness;
+};
 
 struct lm3530_device {
 	struct i2c_client *client;
@@ -46,9 +63,8 @@ struct lm3530_device {
 	int max_current;
 	int min_brightness;
 	int max_brightness;
-	int default_brightness;
-	char *blmap;
-	int blmap_size;
+	int factory_brightness;
+	struct mutex bl_mutex;
 };
 
 static const struct i2c_device_id lm3530_bl_id[] = {
@@ -60,14 +76,16 @@ static int lm3530_write_reg(struct i2c_client *client,
 		unsigned char reg, unsigned char val);
 
 static int cur_main_lcd_level;
+static int cur_write_level;
 static int saved_main_lcd_level;
 static int backlight_status = BL_ON;
 
-static void lm3530_hw_reset(struct i2c_client *client)
-{
-	struct lm3530_device *dev = i2c_get_clientdata(client);
-	int gpio = dev->gpio;
+static struct lm3530_device *main_lm3530_dev;
+static struct early_suspend * h;
 
+static void lm3530_hw_reset(void)
+{
+	int gpio = main_lm3530_dev->gpio;
 	if (gpio_is_valid(gpio)) {
 		gpio_direction_output(gpio, 1);
 		gpio_set_value_cansleep(gpio, 1);
@@ -78,6 +96,7 @@ static void lm3530_hw_reset(struct i2c_client *client)
 static int lm3530_write_reg(struct i2c_client *client,
 		unsigned char reg, unsigned char val)
 {
+    int ret = 0;
 	u8 buf[2];
 	struct i2c_msg msg = {
 		client->addr, 0, 2, buf
@@ -86,159 +105,135 @@ static int lm3530_write_reg(struct i2c_client *client,
 	buf[0] = reg;
 	buf[1] = val;
 
-	if (i2c_transfer(client->adapter, &msg, 1) < 0)
-		dev_err(&client->dev, "i2c write error\n");
+	if ((ret = i2c_transfer(client->adapter, &msg, 1)) < 0)
+		dev_err(&client->dev, "i2c write error, ret = %d\n", ret);
 
-	return 0;
+	return ret;
 }
+
+static char mapped_value[146] = {
+	1 	,1 	,1 	,1 	,1 	,1 	,1 	,1 	,1 	,1 	,1 	,1 	,2 	,2 	,2,
+	2 	,2 	,2 	,2 	,2 	,2 	,2 	,2 	,3 	,3 	,3 	,3 	,3 	,3 	,3,
+	4 	,4 	,4 	,4 	,4 	,4 	,5 	,5 	,5 	,6 	,6 	,6 	,7	,7 	,7,
+	8 	,8 	,8 	,9 	,9 	,9 	,10	,10	,11	,11	,11	,12	,12	,13	,13,
+	14 	,14 ,15	,15	,16	,16	,16	,17	,17	,18	,18	,19	,19	,19	,20,
+	20 	,21 ,22	,22	,23	,24	,24	,25	,26	,26	,27	,28	,29	,30	,30 ,
+	31 	,32 ,33	,34	,34	,35	,36	,37	,38	,39	,40	,41	,41	,42	,43,
+	44 	,45 ,46	,47	,48	,49	,50	,51	,52	,53	,54	,56	,57	,58	,59,
+	60 	,61 ,62	,63	,65	,66	,67	,69	,70	,71	,72	,73	,74	,76	,78,
+	79 	,80 ,82	,83	,85	,87	,88	,90	,91	,92	,94 };
 
 static void lm3530_set_main_current_level(struct i2c_client *client, int level)
 {
 	struct lm3530_device *dev = i2c_get_clientdata(client);
 	int cal_value = 0;
-	int min_brightness = dev->min_brightness;
 	int max_brightness = dev->max_brightness;
+	dev->bl_dev->props.brightness = level;
 
-	dev->bl_dev->props.brightness = cur_main_lcd_level = level;
+	mutex_lock(&main_lm3530_dev->bl_mutex);
 
 	if (level != 0) {
-		if (level > 0 && level <= min_brightness)
-			cal_value = min_brightness;
-		else if (level > min_brightness && level <= max_brightness)
-			cal_value = level;
-		else if (level > max_brightness)
+		if (level > 0 && level < MIN_LEVEL)
+			cal_value = 0;
+		else if (level >= MIN_LEVEL && level <= MAX_LEVEL)
+		{
+			cal_value = mapped_value[level-MIN_LEVEL];
+		}
+		else if (level > MAX_LEVEL)
 			cal_value = max_brightness;
 
-		if (dev->blmap) {
-			if (cal_value < dev->blmap_size)
-				lm3530_write_reg(client, 0xA0,
-						dev->blmap[cal_value]);
-			else
-				dev_warn(&client->dev, "invalid index %d:%d\n",
-						dev->blmap_size,
-						cal_value);
-		} else {
-			lm3530_write_reg(client, 0xA0, cal_value);
-		}
-	} else
+		lm3530_write_reg(client, 0xA0, cal_value);
+		printk(KERN_INFO "%s() :level is : %d, cal_value is :* %d\n", __func__, level, cal_value);
+	}
+	else {
 		lm3530_write_reg(client, 0x10, 0x00);
-
+	}
 	mdelay(1);
+
+	cur_main_lcd_level = cal_value;
+	cur_write_level    = level;
+	pr_info("write_value is : %d, cal_value is : %d\n",cur_write_level, cur_main_lcd_level);
+	mutex_unlock(&main_lm3530_dev->bl_mutex);
 }
 
-static bool first_boot = true;
-static void lm3530_backlight_on(struct i2c_client *client, int level)
+void lm3530_backlight_on(int level)
 {
-	struct lm3530_device *dev = i2c_get_clientdata(client);
-
-	mutex_lock(&backlight_mtx);
 	if (backlight_status == BL_OFF) {
-		pr_info("%s, ++ lm3530_backlight_on  \n",__func__);
-		lm3530_hw_reset(client);
+		msleep(17);
+		printk("%s, ++ lm3530_backlight_on  \n",__func__);
+		lm3530_hw_reset();
 
-		lm3530_write_reg(dev->client, 0xA0, 0x00);
-		lm3530_write_reg(dev->client, 0x10, dev->max_current);
+		lm3530_write_reg(main_lm3530_dev->client, 0xA0, 0x00);
+		/* reset 0 brightness */
+		lm3530_write_reg(main_lm3530_dev->client, 0x10,
+				main_lm3530_dev->max_current);
+
+        backlight_status = BL_ON;
+        /* msleep(100); */
 	}
 
-	if (first_boot) {
-		lm3530_write_reg(dev->client, 0x10, dev->max_current);
-		first_boot = false;
-	}
+	/* printk("%s received (prev backlight_status: %s)\n",
+	 * __func__, backlight_status?"ON":"OFF");*/
+	lm3530_set_main_current_level(main_lm3530_dev->client, level);
 
-	lm3530_set_main_current_level(dev->client, level);
-	backlight_status = BL_ON;
-	mutex_unlock(&backlight_mtx);
+	return;
 }
 
-static void lm3530_backlight_off(struct i2c_client *client)
+void lm3530_backlight_off(struct early_suspend * h)
 {
-	struct lm3530_device *dev = i2c_get_clientdata(client);
-	int gpio = dev->gpio;
+	int gpio = main_lm3530_dev->gpio;
 
-	pr_info("%s, on: %d\n", __func__, backlight_status);
+	printk("%s, backlight_status : %d\n",__func__,backlight_status);
 
-	mutex_lock(&backlight_mtx);
-	if (backlight_status == BL_OFF) {
-		mutex_unlock(&backlight_mtx);
+	if (backlight_status == BL_OFF)
 		return;
-	}
-
 	saved_main_lcd_level = cur_main_lcd_level;
-	lm3530_set_main_current_level(dev->client, 0);
+	lm3530_set_main_current_level(main_lm3530_dev->client, 0);
 	backlight_status = BL_OFF;
 
 	gpio_tlmm_config(GPIO_CFG(gpio, 0, GPIO_CFG_OUTPUT, GPIO_CFG_NO_PULL,
-			GPIO_CFG_2MA), GPIO_CFG_ENABLE);
+				GPIO_CFG_2MA), GPIO_CFG_ENABLE);
 	gpio_direction_output(gpio, 0);
 	msleep(6);
-	mutex_unlock(&backlight_mtx);
+	return;
 }
 
 void lm3530_lcd_backlight_set_level(int level)
 {
-	struct i2c_client *client = lm3530_i2c_client;
-	struct lm3530_device *dev = i2c_get_clientdata(client);
+	if (level > MAX_LEVEL)
+		level = MAX_LEVEL;
 
-	if (!client) {
-		pr_warn("%s: not yet enabled\n", __func__);
-		return;
+	if (lm3530_i2c_client != NULL) {
+		if (level == 0)
+			lm3530_backlight_off(h);
+		else
+			lm3530_backlight_on(level);
+		/*printk(KERN_INFO "%s() : level is : %d\n", __func__, level);*/
+	} else{
+		printk(KERN_INFO "%s(): No client\n", __func__);
 	}
-
-	if (level > dev->max_brightness)
-		level = dev->max_brightness;
-
-	pr_debug("%s: level %d\n", __func__, level);
-	if (level)
-		lm3530_backlight_on(client, level);
-	else
-		lm3530_backlight_off(client);
 }
 EXPORT_SYMBOL(lm3530_lcd_backlight_set_level);
 
-void lm3530_lcd_backlight_pwm_disable(void)
-{
-	struct i2c_client *client = lm3530_i2c_client;
-	struct lm3530_device *dev = i2c_get_clientdata(client);
-
-	if (backlight_status == BL_OFF)
-		return;
-
-	lm3530_write_reg(client, 0x10, dev->max_current & 0x1F);
-}
-EXPORT_SYMBOL(lm3530_lcd_backlight_pwm_disable);
-
-int lm3530_lcd_backlight_on_status(void)
-{
-	return backlight_status;
-}
-EXPORT_SYMBOL(lm3530_lcd_backlight_on_status);
-
 static int bl_set_intensity(struct backlight_device *bd)
 {
-	struct i2c_client *client = lm3530_i2c_client;
-	struct lm3530_device *dev = i2c_get_clientdata(client);
-	int brightness = bd->props.brightness;
-
-	if ((bd->props.state & BL_CORE_FBBLANK) ||
-			(bd->props.state & BL_CORE_SUSPENDED))
-		brightness = 0;
-	else if (brightness == 0)
-		brightness = dev->default_brightness;
-
-	lm3530_lcd_backlight_set_level(brightness);
+	lm3530_lcd_backlight_set_level(bd->props.brightness);
 	return 0;
 }
 
 static int bl_get_intensity(struct backlight_device *bd)
 {
-	return cur_main_lcd_level;
+    return cur_main_lcd_level;
 }
 
 static ssize_t lcd_backlight_show_level(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	return snprintf(buf, PAGE_SIZE, "LCD Backlight Level is : %d\n",
-			cur_main_lcd_level);
+	int r;
+
+	r = snprintf(buf, PAGE_SIZE, "write_value is : %d, cal_value is : %d\n",
+			cur_write_level, cur_main_lcd_level);
+	return r;
 }
 
 static ssize_t lcd_backlight_store_level(struct device *dev,
@@ -257,23 +252,24 @@ static ssize_t lcd_backlight_store_level(struct device *dev,
 
 static int lm3530_bl_resume(struct i2c_client *client)
 {
-	lm3530_backlight_on(client, saved_main_lcd_level);
-	return 0;
+    lm3530_backlight_on(saved_main_lcd_level);
+
+    return 0;
 }
 
 static int lm3530_bl_suspend(struct i2c_client *client, pm_message_t state)
 {
-	pr_info("%s: new state: %d\n", __func__, state.event);
+    printk(KERN_INFO "%s: new state: %d\n", __func__, state.event);
 
-	lm3530_backlight_off(client);
+    lm3530_backlight_off(h);
 
-	return 0;
+    return 0;
 }
 
 static ssize_t lcd_backlight_show_on_off(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	pr_info("%s received (prev backlight_status: %s)\n", __func__,
+	printk(KERN_INFO "%s received (prev backlight_status: %s)\n", __func__,
 			backlight_status ? "ON" : "OFF");
 	return 0;
 }
@@ -287,12 +283,12 @@ static ssize_t lcd_backlight_store_on_off(struct device *dev,
 	if (!count)
 		return -EINVAL;
 
-	pr_info("%s received (prev backlight_status: %s)\n", __func__,
+	printk(KERN_INFO "%s received (prev backlight_status: %s)\n", __func__,
 			backlight_status ? "ON" : "OFF");
 
 	on_off = simple_strtoul(buf, NULL, 10);
 
-	pr_info("%d", on_off);
+	printk(KERN_ERR "%d", on_off);
 
 	if (on_off == 1)
 		lm3530_bl_resume(client);
@@ -319,30 +315,27 @@ static int __devinit lm3530_probe(struct i2c_client *i2c_dev,
 	struct lm3530_device *dev;
 	struct backlight_device *bl_dev;
 	struct backlight_properties props;
-	int err = 0;
+	int err;
+
+	printk("%s: i2c probe start\n", __func__);
 
 	pdata = i2c_dev->dev.platform_data;
-	if (!pdata)
-		return -ENODEV;
+	lm3530_i2c_client = i2c_dev;
 
 	dev = kzalloc(sizeof(struct lm3530_device), GFP_KERNEL);
-	if (!dev) {
-		dev_err(&i2c_dev->dev, "out of memory\n");
-		return -ENOMEM;
+	if (dev == NULL) {
+		dev_err(&i2c_dev->dev, "fail alloc for lm3530_device\n");
+		return 0;
 	}
+
+	main_lm3530_dev = dev;
 
 	memset(&props, 0, sizeof(struct backlight_properties));
 	props.type = BACKLIGHT_RAW;
-	props.max_brightness = pdata->max_brightness;
-
+	props.max_brightness = max_brightness_lm3530;
 	bl_dev = backlight_device_register(I2C_BL_NAME, &i2c_dev->dev, NULL,
 			&lm3530_bl_ops, &props);
-	if (IS_ERR(bl_dev)) {
-		dev_err(&i2c_dev->dev, "failed to register backlight\n");
-		err = PTR_ERR(bl_dev);
-		goto err_backlight_device_register;
-	}
-	bl_dev->props.max_brightness = pdata->max_brightness;
+	bl_dev->props.max_brightness = max_brightness_lm3530;
 	bl_dev->props.brightness = pdata->default_brightness;
 	bl_dev->props.power = FB_BLANK_UNBLANK;
 
@@ -352,70 +345,42 @@ static int __devinit lm3530_probe(struct i2c_client *i2c_dev,
 	dev->max_current = pdata->max_current;
 	dev->min_brightness = pdata->min_brightness;
 	dev->max_brightness = pdata->max_brightness;
-	dev->default_brightness = pdata->default_brightness;
-	dev->blmap = pdata->blmap;
-	dev->blmap_size = pdata->blmap_size;
+	dev->factory_brightness = pdata->factory_brightness;
 	i2c_set_clientdata(i2c_dev, dev);
 
-	if (gpio_is_valid(dev->gpio)) {
-		err = gpio_request(dev->gpio, "lm3530 reset");
-		if (err < 0) {
-			dev_err(&i2c_dev->dev, "failed to request gpio\n");
-			goto err_gpio_request;
-		}
-	}
+	if (dev->gpio && gpio_request(dev->gpio, "lm3530 reset") != 0)
+		return -ENODEV;
+
+	mutex_init(&dev->bl_mutex);
 
 	err = device_create_file(&i2c_dev->dev, &dev_attr_lm3530_level);
-	if (err < 0) {
-		dev_err(&i2c_dev->dev, "failed to create 1st sysfs\n");
-		goto err_device_create_file_1;
-	}
 	err = device_create_file(&i2c_dev->dev,
 			&dev_attr_lm3530_backlight_on_off);
-	if (err < 0) {
-		dev_err(&i2c_dev->dev, "failed to create 2nd sysfs\n");
-		goto err_device_create_file_2;
-	}
 
-	lm3530_i2c_client = i2c_dev;
-
-	pr_info("lm3530 probed\n");
 	return 0;
-
-err_device_create_file_2:
-	device_remove_file(&i2c_dev->dev, &dev_attr_lm3530_level);
-err_device_create_file_1:
-	if (gpio_is_valid(dev->gpio))
-		gpio_free(dev->gpio);
-err_gpio_request:
-	backlight_device_unregister(bl_dev);
-err_backlight_device_register:
-	kfree(dev);
-
-	return err;
 }
 
 static int __devexit lm3530_remove(struct i2c_client *i2c_dev)
 {
-	struct lm3530_device *dev = i2c_get_clientdata(i2c_dev);
+	struct lm3530_device *dev;
+	int gpio = main_lm3530_dev->gpio;
 
-	lm3530_i2c_client = NULL;
 	device_remove_file(&i2c_dev->dev, &dev_attr_lm3530_level);
 	device_remove_file(&i2c_dev->dev, &dev_attr_lm3530_backlight_on_off);
+	dev = (struct lm3530_device *)i2c_get_clientdata(i2c_dev);
+	backlight_device_unregister(dev->bl_dev);
 	i2c_set_clientdata(i2c_dev, NULL);
 
-	if (gpio_is_valid(dev->gpio))
-		gpio_free(dev->gpio);
-
-	backlight_device_unregister(dev->bl_dev);
-	kfree(dev);
-
+	if (gpio_is_valid(gpio))
+		gpio_free(gpio);
 	return 0;
 }
 
 static struct i2c_driver main_lm3530_driver = {
 	.probe = lm3530_probe,
 	.remove = lm3530_remove,
+	.suspend = NULL,
+	.resume = NULL,
 	.id_table = lm3530_bl_id,
 	.driver = {
 		.name = I2C_BL_NAME,
@@ -425,7 +390,11 @@ static struct i2c_driver main_lm3530_driver = {
 
 static int __init lcd_backlight_init(void)
 {
-	return i2c_add_driver(&main_lm3530_driver);
+	static int err;
+
+	err = i2c_add_driver(&main_lm3530_driver);
+
+	return err;
 }
 
 module_init(lcd_backlight_init);
